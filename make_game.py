@@ -2616,7 +2616,7 @@ def build_pipeline_check(jobs: int) -> None:
 
 
 def runtime(game: str, out: str, v: dict, runtime_build: str | None = None, jobs: int = 1,
-            *, work: str | None = None) -> None:
+            *, work: str | None = None, history_jobs: int | None = None) -> None:
     destinations = [*RUNTIME_FILES, "game_path.txt"]
     if work is not None:
         destinations.append("shader_path.txt")
@@ -2659,7 +2659,8 @@ def runtime(game: str, out: str, v: dict, runtime_build: str | None = None, jobs
             profile = os.path.join(os.path.dirname(shader_dir), "bcpack", "history.bcph")
             native = os.path.join(build, "bcpack_history_train.exe")
             trainer = ["--trainer", native] if os.name == "nt" and os.path.isfile(native) else []
-            py("build_dstorage_history.py", game, "--out", profile, "--if-needed", *trainer)
+            py("build_dstorage_history.py", game, "--out", profile, "--if-needed",
+               "--jobs", str(history_jobs or jobs), *trainer)
         # Wine's path converter takes the original Unix filename bytes. The Windows reader expects UTF-8.
         encoded = shader_dir.encode("utf-8") if os.name == "nt" else os.fsencode(shader_dir)
         pending = tempfile.NamedTemporaryFile(dir=out, delete=False)
@@ -2996,6 +2997,8 @@ def run_build_stages(stages: list, *, game: str, work: str, out: str, v: dict, w
     split = max(1, jobs // len(cpu_heavy)) if (overlap and len(cpu_heavy) > 1) else jobs
     dump_jobs = split if (overlap and len(cpu_heavy) > 1 and "assets" in stages) else None
     shader_jobs = split if (overlap and len(cpu_heavy) > 1 and "shaders" in stages) else jobs
+    # The DirectStorage history fit runs beside the CPU-heavy stages: give it one share too.
+    history_jobs = max(1, jobs // (len(cpu_heavy) + 1)) if (overlap and cpu_heavy) else jobs
     progress = StageBoard([s for s in ("shaders", "assets", "runtime", "pipelines") if s in stages])
 
     def fn_shaders():
@@ -3005,7 +3008,7 @@ def run_build_stages(stages: list, *, game: str, work: str, out: str, v: dict, w
         assets(game, work, wav, jobs, dump_jobs=dump_jobs)
 
     def fn_runtime():
-        runtime(game, out, v, runtime_build, jobs, work=work)
+        runtime(game, out, v, runtime_build, jobs, work=work, history_jobs=history_jobs)
 
     def fn_pipelines():
         pipelines(work, out, jobs, runtime_build=runtime_build)

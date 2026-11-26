@@ -1,82 +1,146 @@
 """Build a machine-local DirectStorage predictor sidecar from the player's own pools."""
 import argparse
 from array import array
-from contextlib import closing
+from concurrent.futures import ProcessPoolExecutor
+from contextlib import closing, nullcontext
 import hashlib
 import json
+import multiprocessing
 import os
 from pathlib import Path
 import struct
 import subprocess
 import sys
 import tempfile
+import time
 
 TOOLS = Path(__file__).resolve().parent
 sys.path.insert(0, str(TOOLS))
 import bcpack_history_calib as calib
 import bcpack_tables_bptc as bptc
 import gen_bcpack_runtime_tables as pack
+from pool_workers import process_workers
 import ttpf_mips as ttpf
 
 
-def fit_slices(pools):
+def _fits(log=False):
+    """Fresh BC6H and BC7 calibrators; a worker's log their masks so that they can be merged in pool order."""
+    fits = {6: calib.Bc6hCalibrator(), 7: calib.Bc7Calibrator()}
+    for fit in fits.values():
+        fit.mask_log = {} if log else None
+    return fits
+
+
+def _sent(fits):
+    """A worker's calibrators, None for those that saw no chunk (their state is the initial one)."""
+    return {codec: fit if fit.pool_chunks else None for codec, fit in fits.items()}
+
+
+def _absorb(total, part):
+    for codec, fit in total.items():
+        if part[codec] is not None:
+            fit.absorb(part[codec])
+
+
+def _in_pool_order(executor, task, calls):
+    """task(*call) for each call, whose first argument is a pool; results in the order of `calls` whatever order
+    the workers finish in. The largest pools are submitted first, so that one of them does not run alone at the end."""
+    futures = [None] * len(calls)
+    for i in sorted(range(len(calls)), key=lambda i: -os.path.getsize(calls[i][0])):
+        futures[i] = executor.submit(task, *calls[i])
+    for future in futures:
+        yield future.result()
+
+
+def _calibrate_task(path):
+    fits = _fits(log=True)
+    calib.calibrate_from_pools([path], fits)
+    return _sent(fits)
+
+
+def calibrate(pools, executor=None):
+    """calib.calibrate_from_pools over all pools; its whole state is per pool when `limit` is 0."""
+    fits = _fits()
+    if executor is None:
+        calib.calibrate_from_pools(pools, fits)
+    else:
+        for part in _in_pool_order(executor, _calibrate_task, [(p,) for p in pools]):
+            _absorb(fits, part)
+    return {calib.CODEC_KEYS[c]: f.build_document()[0] for c, f in fits.items()}
+
+
+def _slices_task(path):
+    arrays, tails = _fits(log=True), _fits(log=True)
+    _fit_slices_pool(path, arrays, tails)
+    return _sent(arrays), _sent(tails)
+
+
+def fit_slices(pools, executor=None):
     """Fit same-layer neighbors, including packed 2D mip tails missed by the 256-block scan."""
-    arrays = {6: calib.Bc6hCalibrator(), 7: calib.Bc7Calibrator()}
-    tails = {6: calib.Bc6hCalibrator(), 7: calib.Bc7Calibrator()}
-    for path in pools:
-        with closing(ttpf.Pool(path)) as pool:
-            if not any(chunk[4] in arrays for chunk in pool.chunks):
-                continue
-            for index in range(pool.textures):
-                d = pool.descriptor(index)
-                fit = tails if d["depth"] == 1 else arrays
-                codec = next((c for c in fit if d["format"] in calib.CODEC_DXGI[c]), None)
-                if not codec or d["dimension"] not in (1, 2):
-                    continue
-                a = ttpf.analyze(pool, index)
-                if not a.get("available") or a.get("blocked"):
-                    continue
-                layout = a["layout"]
-                mips = layout["mips"]
-                for layer in range(d["depth"]):
-                    def address(m):
-                        return (d["base"] + layout.get("data_offset", 0) + m["offset"] +
-                                layer * m.get("slice_stride", layout.get("face_size", 0)))
-                    for level, mip in enumerate(mips):
-                        start = address(mip)
-                        chunks = []
-                        for virt, size, offset, packed, mode, _ in pool.chunks_for(start, mip["region"]):
-                            if mode != codec or start - virt >= 2048 * 16:
-                                continue
-                            blocks = min(2048, size // 16)
-                            if d["depth"] == 1:
-                                # In a packed tail the stream starts with other mips or padding.
-                                # The usual 2D fit visits only the first 256 physical blocks.
-                                first = start + calib.tiled_offset(layout, mip, 0, 0) - virt
-                                if not 256 * 16 <= first < blocks * 16:
-                                    continue
-                            chunks.append((size, offset, packed, virt - start, blocks))
-                        if not chunks:
-                            continue
-                        for neighbor, kind in ((level+1, "child"), (level-1, "parent")):
-                            if not 0 <= neighbor < len(mips):
-                                continue
-                            ref = mips[neighbor]
-                            if ref["region"] > 1048576 or pool.codecs(address(ref), ref["region"]) - {0, 8}:
-                                continue
-                            tiled = pool.read_range(address(ref), ref["region"], {}, bcpack_mode="off")
-                            getter = calib._make_sibling_quads_getter(codec, layout, ref, tiled, kind,
-                                                                       signed=d["format"] == 96)
-                            inverse = calib.make_inverse_tile_lookup(layout, mip)
-                            for size, offset, packed, relative, blocks in chunks:
-                                lanes = calib.decode_lanes_prefix(pool.data[offset:offset+packed], codec,
-                                                                  size, blocks*2)
-                                fit[codec].add_pool_chunk(lanes, blocks, inverse, relative, getter)
-                            break
+    arrays, tails = _fits(), _fits()
+    if executor is None:
+        for path in pools:
+            _fit_slices_pool(path, arrays, tails)
+    else:
+        for part_arrays, part_tails in _in_pool_order(executor, _slices_task, [(p,) for p in pools]):
+            _absorb(arrays, part_arrays)
+            _absorb(tails, part_tails)
     docs = {calib.CODEC_KEYS[c]: f.build_document()[0] for c, f in arrays.items()}
     # Existing array and cube fits keep precedence over supplemental 2D observations.
     extend_missing(docs, {calib.CODEC_KEYS[c]: f.build_document()[0] for c, f in tails.items()})
     return docs
+
+
+def _fit_slices_pool(path, arrays, tails):
+    with closing(ttpf.Pool(path)) as pool:
+        if not any(chunk[4] in arrays for chunk in pool.chunks):
+            return
+        for index in range(pool.textures):
+            d = pool.descriptor(index)
+            fit = tails if d["depth"] == 1 else arrays
+            codec = next((c for c in fit if d["format"] in calib.CODEC_DXGI[c]), None)
+            if not codec or d["dimension"] not in (1, 2):
+                continue
+            a = ttpf.analyze(pool, index)
+            if not a.get("available") or a.get("blocked"):
+                continue
+            layout = a["layout"]
+            mips = layout["mips"]
+            for layer in range(d["depth"]):
+                def address(m):
+                    return (d["base"] + layout.get("data_offset", 0) + m["offset"] +
+                            layer * m.get("slice_stride", layout.get("face_size", 0)))
+                for level, mip in enumerate(mips):
+                    start = address(mip)
+                    chunks = []
+                    for virt, size, offset, packed, mode, _ in pool.chunks_for(start, mip["region"]):
+                        if mode != codec or start - virt >= 2048 * 16:
+                            continue
+                        blocks = min(2048, size // 16)
+                        if d["depth"] == 1:
+                            # In a packed tail the stream starts with other mips or padding.
+                            # The usual 2D fit visits only the first 256 physical blocks.
+                            first = start + calib.tiled_offset(layout, mip, 0, 0) - virt
+                            if not 256 * 16 <= first < blocks * 16:
+                                continue
+                        chunks.append((size, offset, packed, virt - start, blocks))
+                    if not chunks:
+                        continue
+                    for neighbor, kind in ((level+1, "child"), (level-1, "parent")):
+                        if not 0 <= neighbor < len(mips):
+                            continue
+                        ref = mips[neighbor]
+                        if ref["region"] > 1048576 or pool.codecs(address(ref), ref["region"]) - {0, 8}:
+                            continue
+                        tiled = pool.read_range(address(ref), ref["region"], {}, bcpack_mode="off")
+                        getter = calib._make_sibling_quads_getter(codec, layout, ref, tiled, kind,
+                                                                   signed=d["format"] == 96)
+                        inverse = calib.make_inverse_tile_lookup(layout, mip)
+                        for size, offset, packed, relative, blocks in chunks:
+                            lanes = calib.decode_lanes_prefix(pool.data[offset:offset+packed], codec,
+                                                              size, blocks*2)
+                            fit[codec].add_pool_chunk(lanes, blocks, inverse, relative, getter)
+                        break
 
 
 def extend_missing(base, extra):
@@ -172,7 +236,82 @@ def _known_quads(getter, layout, ref, kind, unknown):
     return get_quads
 
 
-def fit_decoded_neighbors(pools, docs, rounds=4):
+def _decoded_jobs(path, docs, table):
+    """The (path, index, codec, layer, level) mips of one pool whose streams start at a field the profile lacks."""
+    jobs = []
+    with closing(ttpf.Pool(path)) as pool:
+        wanted = set()
+        for _, size, offset, packed, codec, _ in pool.chunks:
+            if codec in (6, 7):
+                blocks = min(2048, size // 16)
+                lanes = calib.decode_lanes_prefix(pool.data[offset:offset+packed], codec, size, blocks*2)
+                if _unknown_references(codec, lanes, blocks, docs, table):
+                    wanted.add(offset)
+        if not wanted:
+            return jobs
+        for index in range(pool.textures):
+            d = pool.descriptor(index)
+            codec = next((c for c in (6, 7) if d["format"] in calib.CODEC_DXGI[c]), None)
+            if not codec or d["dimension"] not in (1, 2):
+                continue
+            a = ttpf.analyze(pool, index)
+            if not a.get("available") or a.get("blocked"):
+                continue
+            layout = a["layout"]
+            for layer in range(d["depth"]):
+                for level, mip in enumerate(layout["mips"]):
+                    start = (d["base"] + layout.get("data_offset", 0) + mip["offset"] +
+                             layer * mip.get("slice_stride", layout.get("face_size", 0)))
+                    if any(c[2] in wanted for c in pool.chunks_for(start, mip["region"])):
+                        jobs.append((path, index, codec, layer, level))
+    return jobs
+
+
+def _fit_decoded_pool(path, jobs, docs, table, fits):
+    with closing(ttpf.Pool(path)) as pool:
+        cache = {}
+        for _, index, codec, layer, level in jobs:
+            d = pool.descriptor(index)
+            layout = ttpf.analyze(pool, index)["layout"]
+            mips = layout["mips"]
+            def address(m):
+                return (d["base"] + layout.get("data_offset", 0) + m["offset"] +
+                        layer * m.get("slice_stride", layout.get("face_size", 0)))
+            mip = mips[level]
+            start = address(mip)
+            chunks = [(size, offset, packed, virt - start, min(2048, size // 16))
+                      for virt, size, offset, packed, mode, _ in pool.chunks_for(start, mip["region"])
+                      if mode == codec and start - virt < 2048 * 16]
+            for neighbor, kind in ((level+1, "child"), (level-1, "parent")):
+                if not 0 <= neighbor < len(mips) or mips[neighbor]["region"] > 1048576:
+                    continue
+                ref = mips[neighbor]
+                if codec not in pool.codecs(address(ref), ref["region"]):
+                    continue  # a raw or zlib sibling is the other fits' reference
+                try:
+                    tiled, unknown = _decode_known(pool, address(ref), ref["region"], docs, table, cache)
+                except (calib.bcpack.BcpackError, ValueError):
+                    continue
+                getter = _known_quads(calib._make_sibling_quads_getter(codec, layout, ref, tiled, kind,
+                                                                        signed=d["format"] == 96),
+                                      layout, ref, kind, unknown)
+                inverse = calib.make_inverse_tile_lookup(layout, mip)
+                for size, offset, packed, relative, blocks in chunks:
+                    lanes = calib.decode_lanes_prefix(pool.data[offset:offset+packed], codec, size, blocks*2)
+                    fits[codec].add_pool_chunk(lanes, blocks, inverse, relative, getter)
+
+
+def _decoded_jobs_task(path, docs):
+    return _decoded_jobs(path, docs, bptc.load_bc7(docs))
+
+
+def _fit_decoded_task(path, jobs, docs):
+    fits = _fits(log=True)
+    _fit_decoded_pool(path, jobs, docs, bptc.load_bc7(docs), fits)
+    return _sent(fits)
+
+
+def fit_decoded_neighbors(pools, docs, rounds=4, executor=None):
     """Fill fields that only streams without a raw or zlib sibling reference.
 
     The other fits take their reference from a raw or zlib mip. A packed tail whose larger mips are BCPack-coded
@@ -182,69 +321,24 @@ def fit_decoded_neighbors(pools, docs, rounds=4):
     repeat while a round adds fields. Only fields still missing are filled, and never as confirmed.
     """
     table = bptc.load_bc7(docs)
-    jobs = []
-    for path in pools:
-        with closing(ttpf.Pool(path)) as pool:
-            wanted = set()
-            for _, size, offset, packed, codec, _ in pool.chunks:
-                if codec in (6, 7):
-                    blocks = min(2048, size // 16)
-                    lanes = calib.decode_lanes_prefix(pool.data[offset:offset+packed], codec, size, blocks*2)
-                    if _unknown_references(codec, lanes, blocks, docs, table):
-                        wanted.add(offset)
-            if not wanted:
-                continue
-            for index in range(pool.textures):
-                d = pool.descriptor(index)
-                codec = next((c for c in (6, 7) if d["format"] in calib.CODEC_DXGI[c]), None)
-                if not codec or d["dimension"] not in (1, 2):
-                    continue
-                a = ttpf.analyze(pool, index)
-                if not a.get("available") or a.get("blocked"):
-                    continue
-                layout = a["layout"]
-                for layer in range(d["depth"]):
-                    for level, mip in enumerate(layout["mips"]):
-                        start = (d["base"] + layout.get("data_offset", 0) + mip["offset"] +
-                                 layer * mip.get("slice_stride", layout.get("face_size", 0)))
-                        if any(c[2] in wanted for c in pool.chunks_for(start, mip["region"])):
-                            jobs.append((path, index, codec, layer, level))
+    if executor is None:
+        jobs = [job for path in pools for job in _decoded_jobs(path, docs, table)]
+    else:
+        found = _in_pool_order(executor, _decoded_jobs_task, [(path, docs) for path in pools])
+        jobs = [job for pool_jobs in found for job in pool_jobs]
     for _ in range(rounds):
         before = _field_count(docs)
         table = bptc.load_bc7(docs)
-        fits = {6: calib.Bc6hCalibrator(), 7: calib.Bc7Calibrator()}
-        for path in sorted({job[0] for job in jobs}):
-            with closing(ttpf.Pool(path)) as pool:
-                cache = {}
-                for _, index, codec, layer, level in (job for job in jobs if job[0] == path):
-                    d = pool.descriptor(index)
-                    layout = ttpf.analyze(pool, index)["layout"]
-                    mips = layout["mips"]
-                    def address(m):
-                        return (d["base"] + layout.get("data_offset", 0) + m["offset"] +
-                                layer * m.get("slice_stride", layout.get("face_size", 0)))
-                    mip = mips[level]
-                    start = address(mip)
-                    chunks = [(size, offset, packed, virt - start, min(2048, size // 16))
-                              for virt, size, offset, packed, mode, _ in pool.chunks_for(start, mip["region"])
-                              if mode == codec and start - virt < 2048 * 16]
-                    for neighbor, kind in ((level+1, "child"), (level-1, "parent")):
-                        if not 0 <= neighbor < len(mips) or mips[neighbor]["region"] > 1048576:
-                            continue
-                        ref = mips[neighbor]
-                        if codec not in pool.codecs(address(ref), ref["region"]):
-                            continue  # a raw or zlib sibling is the other fits' reference
-                        try:
-                            tiled, unknown = _decode_known(pool, address(ref), ref["region"], docs, table, cache)
-                        except (calib.bcpack.BcpackError, ValueError):
-                            continue
-                        getter = _known_quads(calib._make_sibling_quads_getter(codec, layout, ref, tiled, kind,
-                                                                                signed=d["format"] == 96),
-                                              layout, ref, kind, unknown)
-                        inverse = calib.make_inverse_tile_lookup(layout, mip)
-                        for size, offset, packed, relative, blocks in chunks:
-                            lanes = calib.decode_lanes_prefix(pool.data[offset:offset+packed], codec, size, blocks*2)
-                            fits[codec].add_pool_chunk(lanes, blocks, inverse, relative, getter)
+        fits = _fits()
+        # A round visits the pools in sorted path order, not in the order of `pools`; a merge must follow it.
+        paths = sorted({job[0] for job in jobs})
+        if executor is None:
+            for path in paths:
+                _fit_decoded_pool(path, [job for job in jobs if job[0] == path], docs, table, fits)
+        else:
+            calls = [(path, [job for job in jobs if job[0] == path], docs) for path in paths]
+            for part in _in_pool_order(executor, _fit_decoded_task, calls):
+                _absorb(fits, part)
         extend_missing(docs, {calib.CODEC_KEYS[c]: f.build_document()[0] for c, f in fits.items()})
         if _field_count(docs) == before:
             break
@@ -352,7 +446,28 @@ def fingerprint(pools, base_history):
     return digest.hexdigest()
 
 
-def build(game, output, trainer, base_history=None, json_out=None, if_needed=False):
+class _Phase:
+    """Print one short line with how long the enclosed phase took."""
+    def __init__(self, name):
+        self.name = name
+
+    def __enter__(self):
+        self.start = time.perf_counter()
+
+    def __exit__(self, *exc):
+        if exc[0] is None:
+            print(f"{self.name}: {time.perf_counter() - self.start:.1f} s", flush=True)
+
+
+def _executor(jobs, pools):
+    """Worker processes for --jobs above 1 (spawned, as on Windows); None runs every phase in this process."""
+    if jobs <= 1 or len(pools) <= 1:
+        return nullcontext()
+    return ProcessPoolExecutor(max_workers=process_workers(min(jobs, len(pools))),
+                               mp_context=multiprocessing.get_context("spawn"))
+
+
+def build(game, output, trainer, base_history=None, json_out=None, if_needed=False, jobs=1):
     pools = calib._resolve_pools([str(game)])
     if any(output.resolve() == Path(p).resolve() for p in pools):
         raise ValueError("sidecar must be separate from its inputs")
@@ -362,17 +477,18 @@ def build(game, output, trainer, base_history=None, json_out=None, if_needed=Fal
         if stamp.read_text(encoding="utf-8") == signature + ":" + hashlib.sha256(output.read_bytes()).hexdigest():
             return
     output.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(dir=output.parent) as tmp:
+    with tempfile.TemporaryDirectory(dir=output.parent) as tmp, _executor(jobs, pools) as executor:
         temp = Path(tmp)
         print(f"Fitting DirectStorage predictors from {len(pools)} local pools.", flush=True)
         if base_history:
             docs = {name: json.loads((base_history/(name+".json")).read_text(encoding="utf-8")) for name in ("bc6h", "bc7")}
         else:
-            fits = {6: calib.Bc6hCalibrator(), 7: calib.Bc7Calibrator()}
-            calib.calibrate_from_pools(pools, fits)
-            docs = {calib.CODEC_KEYS[c]: f.build_document()[0] for c, f in fits.items()}
-        extend_missing(docs, fit_slices(pools))
-        fit_decoded_neighbors(pools, docs)
+            with _Phase("Pool calibration"):
+                docs = calibrate(pools, executor)
+        with _Phase("Slice fit"):
+            extend_missing(docs, fit_slices(pools, executor))
+        with _Phase("Decoded neighbor fit"):
+            fit_decoded_neighbors(pools, docs, executor=executor)
         history = temp/"history.json"
         history.write_text(json.dumps(docs), encoding="utf-8", newline="\n")
         if not trainer:
@@ -387,7 +503,8 @@ def build(game, output, trainer, base_history=None, json_out=None, if_needed=Fal
                 trainer = temp/"bcpack_history_train"
                 command = [os.environ.get("CXX", "c++"), "-std=c++20", "-O3", "-I", str(temp), "-o", str(trainer)]
             subprocess.run([*command, str(TOOLS/"bcpack_history_train.cpp")], cwd=temp, check=True)
-        refine(docs, collect(pools, trainer, temp), history)
+        with _Phase("Constraint pass"):
+            refine(docs, collect(pools, trainer, temp), history)
         ep6 = sum(bool(v) for v in docs["bc6h"]["endpointClass"])
         ix6 = sum(bool(v) for v in docs["bc6h"]["indexClass"])
         ep7 = sum(bool(v) for row in docs["bc7"]["historyEndpointBits"] for v in row)
@@ -417,5 +534,9 @@ if __name__ == "__main__":
     ap.add_argument("--base-history", type=Path, help="reuse a local 2D calibration (bc6h.json and bc7.json)")
     ap.add_argument("--if-needed", action="store_true", help="reuse a complete profile for unchanged inputs")
     ap.add_argument("--json-out", type=Path, help="also retain locally fitted JSON for reference checks")
+    ap.add_argument("--jobs", type=int, default=1,
+                    help="worker processes for the pool fits (default 1); the profile is the same for any number")
     args = ap.parse_args()
-    build(args.game, args.out, args.trainer, args.base_history, args.json_out, args.if_needed)
+    if args.jobs < 1:
+        ap.error("--jobs must be at least 1")
+    build(args.game, args.out, args.trainer, args.base_history, args.json_out, args.if_needed, args.jobs)

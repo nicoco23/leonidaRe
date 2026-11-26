@@ -286,7 +286,7 @@ class StageValidationAndSequencingTest(unittest.TestCase):
         self.assertIsNotNone(manager.assets.call_args.kwargs["dump_jobs"])
         manager.runtime.assert_called_once_with(
             os.path.abspath(self.game_dir), os.path.abspath(self.out_dir), unittest.mock.ANY, None,
-            unittest.mock.ANY, work=os.path.abspath(self.work_dir))
+            unittest.mock.ANY, work=os.path.abspath(self.work_dir), history_jobs=unittest.mock.ANY)
         manager.pipelines.assert_called_once_with(
             os.path.abspath(self.work_dir), os.path.abspath(self.out_dir), unittest.mock.ANY,
             runtime_build=None)
@@ -328,6 +328,29 @@ class StageValidationAndSequencingTest(unittest.TestCase):
 
 class JobsHandlingTest(unittest.TestCase):
     """Test --jobs default computation, command-line overrides, and forwarding."""
+
+    def test_history_fit_gets_a_share_of_jobs_beside_cpu_heavy_stages(self):
+        """The runtime stage's DirectStorage history fit overlaps shaders and assets: it gets
+        jobs // (CPU-heavy stages + 1), and the whole --jobs only when nothing CPU-heavy runs beside it. The
+        native runtime build keeps the whole --jobs."""
+        cases = [(["shaders", "assets", "runtime"], True, 4), (["assets", "runtime"], True, 6),
+                 (["shaders", "runtime"], True, 6), (["runtime"], True, 12),
+                 (["shaders", "assets", "runtime"], False, 12)]
+        for stages, overlap, expected in cases:
+            with self.subTest(stages=stages, overlap=overlap), patch("make_game.log"), patch("make_game.shaders"), \
+                    patch("make_game.assets"), patch("make_game.runtime") as runtime:
+                make_game.run_build_stages(stages, game="g", work="w", out="o", v={}, wav=False, jobs=12,
+                                           runtime_build=None, emulate=False, keep_emulated=False, fallbacks=(),
+                                           overlap=overlap)
+                self.assertEqual(runtime.call_args.args[4], 12)
+                self.assertEqual(runtime.call_args.kwargs["history_jobs"], expected)
+        # At least one job, however small --jobs is.
+        with patch("make_game.log"), patch("make_game.shaders"), patch("make_game.assets"), \
+                patch("make_game.runtime") as runtime:
+            make_game.run_build_stages(["shaders", "assets", "runtime"], game="g", work="w", out="o", v={},
+                                       wav=False, jobs=1, runtime_build=None, emulate=False, keep_emulated=False,
+                                       fallbacks=(), overlap=True)
+            self.assertEqual(runtime.call_args.kwargs["history_jobs"], 1)
 
     def test_jobs_default_calculation_scenarios(self):
         scenarios = [

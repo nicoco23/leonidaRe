@@ -1167,8 +1167,47 @@ class BcSimpleCalibrator:
         return doc, stats
 
 
+def _absorb_pool_state(dst, src, capped):
+    """Add `src`, a calibrator that saw only later pools, to `dst` as if `dst` had seen those pools itself.
+
+    Counts add up. A capped observation list keeps its first entries, so the lists are joined in pool order and
+    cut at the cap. The conditional AND on `valid_ix` depends on the order of its masks: `src.mask_log` holds
+    each slot's distinct masks in first-seen order, and replaying them gives the sequential result, because a
+    mask seen again finds the slot already inside it or already disjoint from it (the slot only shrinks)."""
+    if src.mask_log is None:
+        raise ValueError("a calibrator merged into another must log its masks (mask_log = {})")
+    if src.ref_blocks or src.conflicts:
+        raise ValueError("reference pairs depend on their order and are not merged")
+    dst.pool_chunks += src.pool_chunks
+    dst.pool_textures += src.pool_textures
+    for row, add in zip(dst.ix_obs, src.ix_obs):
+        for p, n in enumerate(add):
+            row[p] += n
+    for key, add in src.ix_rel_votes.items():
+        votes = dst.ix_rel_votes[key]
+        for h, n in enumerate(add):
+            votes[h] += n
+    log = dst.mask_log
+    for (k, p), masks in src.mask_log.items():
+        for mask in masks:
+            if dst.valid_ix[k][p] & mask:
+                dst.valid_ix[k][p] &= mask
+            if log is not None:
+                seen = log.setdefault((k, p), [])
+                if mask not in seen:
+                    seen.append(mask)
+    for name, cap in capped:
+        mine = getattr(dst, name)
+        for key, obs in getattr(src, name).items():
+            lst = mine.setdefault(key, [])
+            lst.extend(obs[:cap - len(lst)])
+
+
 class Bc6hCalibrator:
     """Calibrator for BC6H (`codec 6`) endpoint and index initial history tables."""
+
+    W_OBS_CAP = 64
+    D_OBS_CAP = 96
 
     def __init__(self):
         # Exact reference-pair constraints:
@@ -1192,6 +1231,13 @@ class Bc6hCalibrator:
         # d_obs[(k, c, q)] -> list of (dc, dz) for transformed-mode centering (q in 1, 2, 3)
         self.d_obs = {}
         self.ep_seen = [False] * 256
+        # (k, p) -> distinct valid_ix masks in first-seen order, kept only when set to {} (see absorb).
+        self.mask_log = None
+
+    def absorb(self, other):
+        """Add a calibrator that saw the pools after this one's (see _absorb_pool_state)."""
+        _absorb_pool_state(self, other, (("w_obs", self.W_OBS_CAP), ("d_obs", self.D_OBS_CAP)))
+        self.ep_seen = [a or b for a, b in zip(self.ep_seen, other.ep_seen)]
 
     def add_reference_chunk(self, lanes, ref_blocks, nblocks, *, valid_blocks=None):
         """Algebraically invert direct built-in BC6H history references from exact blocks."""
@@ -1274,6 +1320,8 @@ class Bc6hCalibrator:
     def add_pool_chunk(self, lanes, nblocks, inv_lookup=None, chunk_rel_start=0, get_quads=None):
         """Accumulate algebraic constraints and optional sibling-mip HDR endpoint targets."""
         self.pool_chunks += 1
+        mask_log = self.mask_log
+        w_cap, d_cap = self.W_OBS_CAP, self.D_OBS_CAP
         l0, l1, l15 = lanes[0], lanes[1], lanes[15]
         deint0, deint1 = bcpack._DEINT
         a2 = _bptc.BC7_ANCHOR2
@@ -1327,6 +1375,10 @@ class Bc6hCalibrator:
                                 mask |= 1 << h
                         if self.valid_ix[ki][p_idx] & mask:
                             self.valid_ix[ki][p_idx] &= mask
+                        if mask_log is not None:
+                            seen = mask_log.setdefault((ki, p_idx), [])
+                            if mask not in seen:
+                                seen.append(mask)
                         self.ix_obs[ki][p_idx] += 1
                     if pmap is None:
                         sm_i = p2[part] if reg == 2 else None
@@ -1366,16 +1418,16 @@ class Bc6hCalibrator:
                     if trans:
                         dz1 = bcpack._unzig(bcpack._inter(lanes[5 + c][a], lanes[5 + c][b], 5))
                         lst1 = self.d_obs.setdefault((ke, c, 1), [])
-                        if len(lst1) < 96:
+                        if len(lst1) < d_cap:
                             lst1.append((dc, dz1))
                         if reg == 2:
                             dz2 = bcpack._unzig(lanes[8 + c][a])
                             dz3 = bcpack._unzig(lanes[8 + c][b])
                             lst2 = self.d_obs.setdefault((ke, c, 2), [])
-                            if len(lst2) < 96:
+                            if len(lst2) < d_cap:
                                 lst2.append((dc, dz2))
                             lst3 = self.d_obs.setdefault((ke, c, 3), [])
-                            if len(lst3) < 96:
+                            if len(lst3) < d_cap:
                                 lst3.append((dc, dz3))
                 elif pchain[c] is not None:
                     pops = pchain[c]
@@ -1397,7 +1449,7 @@ class Bc6hCalibrator:
             for c in range(3):
                 if cur_w[c] is not None:
                     lst = self.w_obs.setdefault((ke, c), [])
-                    if len(lst) < 64:
+                    if len(lst) < w_cap:
                         lst.append((cur_w[c], mode, max(0.0, min(65535.0, mean_rgb[c])), wt))
 
     @staticmethod
@@ -1560,6 +1612,8 @@ class Bc6hCalibrator:
 class Bc7Calibrator:
     """Calibrator for BC7 (`codec 7`) endpoint and index initial history tables."""
 
+    EP_OBS_CAP = 60
+
     def __init__(self):
         self.tab = _bptc.load_bc7()
         # Exact reference-pair constraints
@@ -1576,6 +1630,25 @@ class Bc7Calibrator:
         self.ix_rel_votes = {(k, p): [0] * 16 for k in range(256) for p in range(32)}
         self.pbit_parity = {}
         self.ep_obs = {}
+        # (k, p) -> distinct valid_ix masks in first-seen order, kept only when set to {} (see absorb).
+        self.mask_log = None
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        del state["tab"]  # the built-in BPTC tables, rebuilt on load
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        self.tab = _bptc.load_bc7()
+
+    def absorb(self, other):
+        """Add a calibrator that saw the pools after this one's (see _absorb_pool_state)."""
+        _absorb_pool_state(self, other, (("ep_obs", self.EP_OBS_CAP),))
+        for key, (c0, c1) in other.pbit_parity.items():
+            rec = self.pbit_parity.setdefault(key, [0, 0])
+            rec[0] += c0
+            rec[1] += c1
 
     def add_reference_chunk(self, lanes, ref_blocks, nblocks, *, valid_blocks=None):
         """Algebraically invert direct built-in BC7 history references from exact blocks."""
@@ -1690,6 +1763,8 @@ class Bc7Calibrator:
     def add_pool_chunk(self, lanes, nblocks, inv_lookup=None, chunk_rel_start=0, get_quads=None):
         """Accumulate BC7 anchor/p-bit constraints and optional sibling-mip RGBA endpoint fits."""
         self.pool_chunks += 1
+        mask_log = self.mask_log
+        ep_cap = self.EP_OBS_CAP
         cfg = self.tab["config"]
         rank_of = self.tab["rank_of"]
         inferred = self.tab["inferred"]
@@ -1751,6 +1826,10 @@ class Bc7Calibrator:
                                 mask |= 1 << h
                         if self.valid_ix[ki][p_idx] & mask:
                             self.valid_ix[ki][p_idx] &= mask
+                        if mask_log is not None:
+                            seen = mask_log.setdefault((ki, p_idx), [])
+                            if mask not in seen:
+                                seen.append(mask)
                         self.ix_obs[ki][p_idx] += 1
                     if pmap is None:
                         sm_i = None if ns == 1 else (p2[part] if ns == 2 else p3[part])
@@ -1785,6 +1864,10 @@ class Bc7Calibrator:
                                     mask |= 1 << h
                             if self.valid_ix[ki][16] & mask:
                                 self.valid_ix[ki][16] &= mask
+                            if mask_log is not None:
+                                seen = mask_log.setdefault((ki, 16), [])
+                                if mask not in seen:
+                                    seen.append(mask)
                             self.ix_obs[ki][16] += 1
                         if pmap is None:
                             for p_idx in range(1, 16):
@@ -1890,7 +1973,7 @@ class Bc7Calibrator:
                         continue
                     orig_sub = ss0 // 8
                     lst = self.ep_obs.setdefault((ke, orig_sub, c), [])
-                    if len(lst) < 60:
+                    if len(lst) < ep_cap:
                         lst.append((ops0, ops1, sub_rgba[c], weight))
 
     @staticmethod
