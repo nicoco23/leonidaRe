@@ -3427,6 +3427,8 @@ private:
             // workers stay alive), then re-prepare on pass 1 against current resources.
             PipelineCompiles compiles;
             replay.compiles = &compiles;
+            // Pass 1: what pass 0 compiled, so an indirect RECTLIST variant it could not build is skipped in prepare.
+            replay.compiled = has_prior_compiles ? &prior_compiles : nullptr;
             ReplayResult prepare_result = ReplayResult::success;
             for (std::size_t i = 0; i < lists.size(); ++i) {
                 const auto result = prepare(*lists[i], resolve, replay, prepared[i], can_resolve_occlusion);
@@ -3484,6 +3486,7 @@ private:
                                  : build_pipelines_serial(compiles, std::span(prepared).first(lists.size()),
                                                           prepare_result, prior);
             replay.compiles = nullptr;
+            replay.compiled = nullptr;
             if (prepare_result != ReplayResult::success) return prepare_result;
             break;
         }

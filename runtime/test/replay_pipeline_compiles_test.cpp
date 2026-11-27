@@ -39,7 +39,7 @@ T handle(std::uintptr_t n) {
     return reinterpret_cast<T>(n);
 }
 
-constexpr ResourceId color_id = 1, depth_id = 2, arguments_id = 3;
+constexpr ResourceId color_id = 1, depth_id = 2, arguments_id = 3, draw_arguments_id = 4;
 constexpr std::uint64_t bad_va = 0xbad0000;
 
 // The large pipelines being built now, and how often there were two, where they are to compile one after another.
@@ -161,7 +161,7 @@ struct Registry {
 };
 
 struct CommandSpec {
-    enum Kind { draw, dispatch, indirect_dispatch } kind = draw;
+    enum Kind { draw, dispatch, indirect_dispatch, indirect_draw } kind = draw;
     std::uintptr_t pipeline = 1;
     int colors = 1;            // how many render targets are bound
     bool depth = false;
@@ -199,7 +199,10 @@ std::vector<CommandList> record(const std::vector<std::vector<CommandSpec>>& spe
                 views->vertex_buffers[0].size = 64;
                 d.views = views;
                 if (c.depth) d.depth = {depth_id, 0, 0, 1};
-                list.draw(d);
+                if (c.kind == CommandSpec::indirect_draw)
+                    list.draw_indirect(std::move(d), IndirectDrawArgs{draw_arguments_id, 0, 16, 1, 0, 0});
+                else
+                    list.draw(d);
             }
         }
         list.close();
@@ -229,6 +232,11 @@ ReplayFunctions functions(const Registry& registry) {
     vk.draw = +[](VkCommandBuffer, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t) {};
     vk.draw_indexed = +[](VkCommandBuffer, std::uint32_t, std::uint32_t, std::uint32_t, std::int32_t, std::uint32_t) {};
     vk.draw_mesh_tasks = +[](VkCommandBuffer, std::uint32_t, std::uint32_t, std::uint32_t) {};
+    vk.draw_indirect = +[](VkCommandBuffer, VkBuffer, VkDeviceSize, std::uint32_t, std::uint32_t) {};
+    vk.draw_indexed_indirect = +[](VkCommandBuffer, VkBuffer, VkDeviceSize, std::uint32_t, std::uint32_t) {};
+    vk.draw_indirect_first_instance = true;
+    vk.multi_draw_indirect = true;
+    vk.max_draw_indirect_count = UINT32_MAX;
     vk.image_view = [](const ResourceBinding&, const VkImageSubresourceRange&) { return handle<VkImageView>(8); };
     vk.buffer_at = [](std::uint64_t va, std::uint64_t&, VkBuffer& buffer, VkDeviceSize& offset) {
         if (va == bad_va) return false;
@@ -271,7 +279,18 @@ const ResourceBinding* resolve(ResourceId id) {
         b.size = 4096;
         return b;
     }();
-    return id == color_id ? &color : id == depth_id ? &depth : id == arguments_id ? &arguments : nullptr;
+    static const ResourceBinding draw_arguments = [] {
+        auto b = binding(0, VK_FORMAT_UNDEFINED);
+        b.buffer = handle<VkBuffer>(13);
+        b.size = 4096;
+        b.indirect_arguments = true;
+        return b;
+    }();
+    if (id == color_id) return &color;
+    if (id == depth_id) return &depth;
+    if (id == arguments_id) return &arguments;
+    if (id == draw_arguments_id) return &draw_arguments;
+    return nullptr;
 }
 
 struct Outcome {
@@ -307,7 +326,7 @@ Outcome prepare_all(const std::vector<CommandList>& lists, const std::vector<Pip
         for (std::size_t i = 0; i < lists.size(); ++i) {
             for (std::size_t c = 0; c < prepared[i].commands.size(); ++c) {
                 const auto& command = lists[i].commands()[c];
-                if (std::holds_alternative<Draw>(command)) {
+                if (draw_command(command).state) {
                     const auto& draw = prepared[i].draws[prepared[i].commands[c].draw];
                     out.pipelines.push_back(draw.skipped ? VkPipeline(VK_NULL_HANDLE) : draw.pipeline);
                     check(draw.skipped || draw.pipeline, "a draw neither dropped nor with a pipeline");
@@ -453,6 +472,21 @@ void cases(PipelineWorkers& workers) {
     mesh.mesh = true;
     out = compare("a mesh draw with a vertex pipeline", {pending}, {{mesh}}, workers);
     check(out.result == ReplayResult::invalid_draw && out.built.empty(), "refused before its pipeline is built");
+
+    // An indirect RECTLIST draw takes its rectangle_stage variant from PipelineCompiles too, so that it is compiled
+    // without the resource lock; one that cannot be built skips the draw, never fails the list (#1896).
+    const CommandSpec indirect_rectangle{.kind = CommandSpec::indirect_draw, .rectangle = true};
+    out = compare("an indirect rectangle draw", {{.rectangle = true}}, {{indirect_rectangle}}, workers);
+    check(out.result == ReplayResult::success && out.jobs == 1 && out.pipelines.size() == 1 && out.pipelines[0],
+          "its variant is one job");
+    const auto skips = indirect_stats::reason_skips(indirect_stats::topology);
+    const PipelineSpec failing_rectangle{.fails = true, .rectangle = true};
+    out = compare("an indirect rectangle draw whose variant cannot be built", {failing_rectangle, pending},
+                  {{indirect_rectangle, use(2)}}, workers);
+    check(out.result == ReplayResult::success && out.jobs == 2 && out.pipelines.size() == 2 && !out.pipelines[0] &&
+              out.pipelines[1],
+          "the draw is skipped, the list goes on");
+    check(indirect_stats::reason_skips(indirect_stats::topology) == skips + 2, "skipped once by each run");
 }
 
 // More than one worker's worth of pipelines, so that the batch really runs on several threads.

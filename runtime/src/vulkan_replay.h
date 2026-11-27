@@ -1013,7 +1013,9 @@ public:
     // Where a prepared command finds its pipeline: an index for `built`, plus one; 0 when it needs none.
     using Ticket = std::uint32_t;
     // Which command needs a pipeline: it decides what a pipeline that cannot be built means (build_pipelines).
-    enum class User : std::uint8_t { draw, dispatch, indirect_dispatch };
+    // indirect_rect_draw: an indirect RECTLIST draw through the rectangle_stage variant; one that cannot be built is
+    // skipped (indirect_stats::skip), as prepare() does when it builds on the spot, instead of failing the list.
+    enum class User : std::uint8_t { draw, dispatch, indirect_dispatch, indirect_rect_draw };
     struct Use {
         Ticket ticket;
         User user;
@@ -1022,8 +1024,8 @@ public:
     // pipelines of this much or more are `large`. For compute pipelines the D3D12 layer decides.
     static constexpr std::uint64_t large_spirv_bytes = 1u << 20;
 
-    Ticket add(const GraphicsPipeline& pipeline, std::uint32_t flags) {
-        return add({&pipeline, nullptr, flags}, User::draw);
+    Ticket add(const GraphicsPipeline& pipeline, std::uint32_t flags, User user = User::draw) {
+        return add({&pipeline, nullptr, flags}, user);
     }
     Ticket add(const ComputePipeline& pipeline, User user) { return add({nullptr, &pipeline, 0}, user); }
 
@@ -1114,8 +1116,9 @@ public:
     }
 
     // Compiles jobs serially in command order without workers, stopping at the first fatal refusal (a failed draw, a
-    // failed indirect dispatch, or any failed dispatch under strict_replay()). Matches serial prepare() short-circuit
-    // semantics while allowing the caller to compile outside resource_mutex_.
+    // failed indirect dispatch, or any failed dispatch under strict_replay(); a failed indirect_rect_draw is skipped,
+    // never fatal). Matches serial prepare() short-circuit semantics while allowing the caller to compile outside
+    // resource_mutex_.
     void build_serial(const PipelineCompiles* prior = nullptr) {
         std::vector<bool> done(jobs_.size(), false);
         for (const Use& use : uses_) {
@@ -1128,7 +1131,8 @@ public:
                         job.graphics ? job.graphics->variant(job.flags) : job.compute->build(job.compute->build_context);
                 }
             }
-            if (!jobs_[i].built && (use.user == User::draw || use.user == User::indirect_dispatch || strict_replay()))
+            if (!jobs_[i].built && (use.user == User::draw || use.user == User::indirect_dispatch ||
+                                    (strict_replay() && use.user != User::indirect_rect_draw)))
                 return;
         }
     }
@@ -1159,6 +1163,8 @@ private:
 struct ReplayFunctions {
     // Set: prepare() leaves pipelines that are not built to it instead of building each on the spot.
     PipelineCompiles* compiles = nullptr;
+    // Set with `compiles` on the second pass of a deferred submission: the outcomes of the first one, read only.
+    const PipelineCompiles* compiled = nullptr;
     std::function<void(VkCommandBuffer, const label::Write&)> gpu_label;
     // Set 0 for the pipelines that declare one (their own `bindless_set` is only the marker): the device's current
     // generation of it, which a flush may have replaced since the pipeline was made. Null: the pipeline's.
@@ -1520,10 +1526,14 @@ struct PreparedDraw {
     // The draw is dropped at emit: its pipeline, a vertex buffer or its index buffer could not be resolved (see
     // skip_unresolved in prepare).
     bool skipped = false;
+    // With `compile`: a pipeline that cannot be built skips the draw (indirect RECTLIST through rectangle_stage)
+    // instead of failing the list; finish_compiled_pipelines sets `skipped` then.
+    bool skip_if_unbuilt = false;
 
     // Back to a new draw's state, keeping the vectors' storage.
     void reset() {
         skipped = false;
+        skip_if_unbuilt = false;
         graphics = nullptr;
         pipeline = VK_NULL_HANDLE;
         compile = 0;
@@ -2862,9 +2872,22 @@ ReplayResult prepare_draw(const Draw& draw, const IndirectDrawArgs* arguments, R
     if (pipeline->requested) pipeline->requested(pipeline->request_context, unbound);
     if (unbound || !p.pipeline) {
         const bool indirect_rect_variant = arguments && (unbound & GraphicsPipeline::rectangle_stage);
-        if (vk.compiles && pipeline->variant && pipeline->built && !pipeline->async_build && !indirect_rect_variant) {
+        if (vk.compiles && pipeline->variant && pipeline->built && !pipeline->async_build) {
             p.pipeline = pipeline->built(unbound);
-            if (!p.pipeline) p.compile = vk.compiles->add(*pipeline, unbound);
+            // An indirect RECTLIST variant the previous pass could not build: skipped here, before the clamp and the
+            // statistics segments are planned, as when it is built on the spot (below).
+            if (!p.pipeline && indirect_rect_variant && vk.compiled &&
+                vk.compiled->lookup(pipeline, nullptr, unbound, p.pipeline) && !p.pipeline) {
+                indirect_stats::skip(indirect_stats::Event::replay_skip, indirect_stats::topology);
+                p.skipped = true;
+                return ReplayResult::success;
+            }
+            if (!p.pipeline) {
+                p.compile = vk.compiles->add(*pipeline, unbound,
+                                             indirect_rect_variant ? PipelineCompiles::User::indirect_rect_draw
+                                                                   : PipelineCompiles::User::draw);
+                p.skip_if_unbuilt = indirect_rect_variant;
+            }
         } else {
             p.pipeline = pipeline->variant ? pipeline->variant(unbound) : VK_NULL_HANDLE;
             if (!p.pipeline && pipeline->async_build && !strict_replay()) {
@@ -3108,11 +3131,13 @@ public:
 // Checks the outcomes of a compiled PipelineCompiles batch against `result` (the first prepare() failure, if any).
 // Every use in `compiles` comes from a command before the one that failed, so a pipeline that cannot be built counts
 // first, at the earliest command that uses it: it fails the list of a draw or an indirect dispatch, and a dispatch is
-// dropped as prepare() drops one. Non-strict failed dispatches already logged in `prior` are not logged twice.
+// dropped as prepare() drops one. An indirect RECTLIST draw is skipped instead (finish_compiled_pipelines), as prepare()
+// skips one. Non-strict failed dispatches already logged in `prior` are not logged twice.
 inline ReplayResult check_compiled_pipelines(const PipelineCompiles& compiles, ReplayResult result,
                                              const PipelineCompiles* prior = nullptr) {
     for (const PipelineCompiles::Use& use : compiles.uses()) {
         if (compiles.built(use.ticket)) continue;
+        if (use.user == PipelineCompiles::User::indirect_rect_draw) continue;
         if (use.user == PipelineCompiles::User::draw) return unsupported_at(__LINE__);
         if (use.user == PipelineCompiles::User::indirect_dispatch || strict_replay()) return unresolved_at(__LINE__);
         if (!prior || !prior->contains_ticket(compiles, use.ticket)) unresolved_at(__LINE__);
@@ -3127,8 +3152,17 @@ inline ReplayResult finish_compiled_pipelines(const PipelineCompiles& compiles, 
     for (PreparedList& list : lists) {
         for (detail::Prepared& command : list.commands)
             if (command.compile) command.pipeline.pipeline = compiles.built(command.compile);
-        for (std::size_t i = 0; i < list.draw_count; ++i)
-            if (list.draws[i].compile) list.draws[i].pipeline = compiles.built(list.draws[i].compile);
+        for (std::size_t i = 0; i < list.draw_count; ++i) {
+            detail::PreparedDraw& draw = list.draws[i];
+            if (!draw.compile) continue;
+            draw.pipeline = compiles.built(draw.compile);
+            // check_compiled_pipelines lets only these through unbuilt. The clamp and the statistics segments
+            // planned for the draw stay: emit still runs the clamp of a skipped draw.
+            if (!draw.pipeline && draw.skip_if_unbuilt) {
+                indirect_stats::skip(indirect_stats::Event::replay_skip, indirect_stats::topology);
+                draw.skipped = true;
+            }
+        }
     }
     return checked;
 }
@@ -5507,7 +5541,6 @@ inline void emit_commands(const PreparedList& prepared, VkCommandBuffer command_
         } else if (raster.state) {
             const Draw* draw = raster.state;
             const detail::PreparedDraw& d = prepared.draws[p.draw];
-            if (d.skipped) continue;  // could not be resolved in prepare: dropped
             // The clamp pass for a stateful indirect draw (vulkan_indirect_clamp.h) runs before vkCmdBeginRendering,
             // because its copy and transfer barrier are not allowed inside a dynamic-rendering scope. It is a helper
             // dispatch, so a pipeline-statistics query must not count it, and it runs even under a false predicate.
@@ -5518,6 +5551,9 @@ inline void emit_commands(const PreparedList& prepared, VkCommandBuffer command_
                 if (predicate.buffer) vk.begin_conditional_rendering(command_buffer, &predicate);
                 begin_statistics();
             }
+            // After the clamp: a draw skipped once its pipelines were compiled (finish_compiled_pipelines) keeps the
+            // clamp and statistics segments planned for it; one skipped in prepare never has a clamp.
+            if (d.skipped) continue;  // not resolved in prepare, or its pipeline not built: dropped
             if constexpr (Checkpoints)
                 checkpoints->record(command_buffer, i, CheckpointKind::draw,
                                     d.pipeline, draw->pipeline);

@@ -284,21 +284,56 @@ void test_rect_list_builtin_and_fallback() {
     }
 
     // 2. Indirect RECTLIST when the pipeline cannot build a rectangle_stage variant -> skips cleanly with topology,
-    //    never fails the command list (both without and with vk.compiles).
-    for (const bool with_compiles : {false, true}) {
+    //    never fails the command list (#1896). Without vk.compiles, prepare() tries the variant on the spot.
+    {
         Harness h;
         h.pipeline.variant = [](std::uint32_t) { return VkPipeline(VK_NULL_HANDLE); };
         h.pipeline.built = [](std::uint32_t) { return VkPipeline(VK_NULL_HANDLE); };
-        leonida::PipelineCompiles compiles;
-        if (with_compiles) h.vk.compiles = &compiles;
-
         const auto before = leonida::indirect_stats::reason_skips(leonida::indirect_stats::topology);
         const leonida::Draw d = make_base_draw(leonida::topology_rect_list, false);
         leonida::IndirectDrawArgs arg{1, 0, 16, 2, 0, 0};
         CHECK(h.run_indirect(d, arg) == leonida::ReplayResult::success);
         CHECK(h.draws.empty());
-        CHECK(compiles.empty());
         CHECK(leonida::indirect_stats::reason_skips(leonida::indirect_stats::topology) == before + 1);
+    }
+    //    With vk.compiles, the variant is left to the deferred compiles like any other (VulkanQueue compiles them
+    //    without the resource lock), and the draw is skipped once build_pipelines finds it unbuilt; the next pass,
+    //    given that outcome in vk.compiled, skips it in prepare() and compiles nothing.
+    {
+        Harness h;
+        h.pipeline.variant = [](std::uint32_t) { return VkPipeline(VK_NULL_HANDLE); };
+        h.pipeline.built = [](std::uint32_t) { return VkPipeline(VK_NULL_HANDLE); };
+        leonida::PipelineCompiles compiles;
+        h.vk.compiles = &compiles;
+        const auto before = leonida::indirect_stats::reason_skips(leonida::indirect_stats::topology);
+        leonida::CommandList list;
+        CHECK(list.draw_indirect(make_base_draw(leonida::topology_rect_list, false),
+                                  leonida::IndirectDrawArgs{1, 0, 16, 2, 0, 0}));
+        CHECK(list.close());
+        const auto resolve = [&h](leonida::ResourceId id) -> const leonida::ResourceBinding* {
+            return id == 1 ? &h.args : nullptr;
+        };
+        leonida::PreparedList prepared;
+        CHECK(leonida::prepare(list, resolve, h.vk, prepared) == leonida::ReplayResult::success);
+        CHECK(compiles.size() == 1);
+        CHECK(prepared.draw_count == 1 && !prepared.draws[0].skipped && prepared.draws[0].compile);
+        CHECK(leonida::indirect_stats::reason_skips(leonida::indirect_stats::topology) == before);
+        CHECK(leonida::build_pipelines_serial(compiles, std::span(&prepared, 1), leonida::ReplayResult::success) ==
+              leonida::ReplayResult::success);
+        CHECK(prepared.draws[0].skipped);
+        CHECK(leonida::indirect_stats::reason_skips(leonida::indirect_stats::topology) == before + 1);
+        h.draws.clear();
+        leonida::emit(prepared, VK_NULL_HANDLE, h.vk);
+        CHECK(h.draws.empty());
+
+        leonida::PipelineCompiles second;
+        h.vk.compiles = &second;
+        h.vk.compiled = &compiles;
+        leonida::PreparedList again;
+        CHECK(leonida::prepare(list, resolve, h.vk, again) == leonida::ReplayResult::success);
+        CHECK(second.empty());
+        CHECK(again.draw_count == 1 && again.draws[0].skipped);
+        CHECK(leonida::indirect_stats::reason_skips(leonida::indirect_stats::topology) == before + 2);
     }
 
     // 3. Direct RECTLIST when rectangle_stage variant cannot be built still returns unsupported (unchanged).

@@ -1,7 +1,9 @@
 // VulkanQueue::execute_now() releases resource_mutex_ and tracker_mutex_ while compiling unbuilt pipelines under
 // pipeline_mutex_ alone, so add_resource()/remove_resource() and other queues do not stall behind shader compiles,
 // remove_pipeline() still waits until compilation finishes, failed non-strict dispatches build only once, and
-// pass-1 re-preparation observes resource updates made while resource_mutex_ was unlocked. No GPU or game data.
+// pass-1 re-preparation observes resource updates made while resource_mutex_ was unlocked. An indirect RECTLIST
+// draw's fourth-corner variant compiles under the same rule, and one that cannot be built skips the draw once and
+// leaves the list successful. No GPU or game data.
 #include "../src/vulkan_backend.h"
 
 #include <atomic>
@@ -9,6 +11,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <memory>
 #include <mutex>
 #include <string_view>
@@ -32,6 +35,7 @@ VulkanDeviceFunctions driver{};
 std::atomic<std::uintptr_t> next_handle{10};
 std::mutex record_mutex;
 std::vector<std::pair<VkBuffer, VkBuffer>> recorded_copies;
+std::atomic<int> recorded_indirect_draws{0};
 
 PFN_vkVoidFunction VKAPI_CALL mock_get_device_proc(VkDevice, const char* name) {
 #define MOCK_DEVICE_FUNCTION(n) \
@@ -86,6 +90,24 @@ void init_mock_driver() {
                                         const VkBufferImageCopy*) {};
     driver.vkCmdCopyImage = +[](VkCommandBuffer, VkImage, VkImageLayout, VkImage, VkImageLayout, std::uint32_t,
                                 const VkImageCopy*) {};
+    driver.vkCmdBeginRendering = +[](VkCommandBuffer, const VkRenderingInfo*) {};
+    driver.vkCmdEndRendering = +[](VkCommandBuffer) {};
+    driver.vkCmdBindVertexBuffers2 = +[](VkCommandBuffer, std::uint32_t, std::uint32_t, const VkBuffer*,
+                                         const VkDeviceSize*, const VkDeviceSize*, const VkDeviceSize*) {};
+    driver.vkCmdBindIndexBuffer = +[](VkCommandBuffer, VkBuffer, VkDeviceSize, VkIndexType) {};
+    driver.vkCmdSetViewport = +[](VkCommandBuffer, std::uint32_t, std::uint32_t, const VkViewport*) {};
+    driver.vkCmdSetScissor = +[](VkCommandBuffer, std::uint32_t, std::uint32_t, const VkRect2D*) {};
+    driver.vkCmdSetPrimitiveTopology = +[](VkCommandBuffer, VkPrimitiveTopology) {};
+    driver.vkCmdSetPrimitiveRestartEnable = +[](VkCommandBuffer, VkBool32) {};
+    driver.vkCmdSetStencilReference = +[](VkCommandBuffer, VkStencilFaceFlags, std::uint32_t) {};
+    driver.vkCmdSetBlendConstants = +[](VkCommandBuffer, const float*) {};
+    driver.vkCmdDraw = +[](VkCommandBuffer, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t) {};
+    driver.vkCmdDrawIndexed = +[](VkCommandBuffer, std::uint32_t, std::uint32_t, std::uint32_t, std::int32_t,
+                                  std::uint32_t) {};
+    driver.vkCmdDrawIndirect = +[](VkCommandBuffer, VkBuffer, VkDeviceSize, std::uint32_t, std::uint32_t) {
+        recorded_indirect_draws.fetch_add(1, std::memory_order_relaxed);
+    };
+    driver.vkCmdDrawIndexedIndirect = +[](VkCommandBuffer, VkBuffer, VkDeviceSize, std::uint32_t, std::uint32_t) {};
 }
 
 struct SlowPipeline {
@@ -279,13 +301,132 @@ int test_failed_compute_dispatch_built_once() {
     return 0;
 }
 
+// An indirect RECTLIST draw through a pipeline whose fourth-corner variant (rectangle_stage) is not built yet.
+constexpr std::uint32_t rectangle_topology = 17;
+constexpr std::uintptr_t rectangle_id = 0x400;
+constexpr ResourceId rectangle_arguments = 4;
+const GraphicsIndirectCapabilities rectangle_indirect{.first_instance = true, .multiple = true,
+                                                      .max_count = UINT32_MAX};
+
+void add_indirect_rectangle(VulkanContext& context, SlowPipeline& variant) {
+    ResourceBinding arguments{};
+    arguments.buffer = handle<VkBuffer>(404);
+    arguments.size = 4096;
+    arguments.indirect_arguments = true;
+    context.add_resource(rectangle_arguments, arguments);
+
+    // No render targets and no vertex buffers: the draw needs neither image views nor VA lookups.
+    GraphicsPipeline pso{};
+    pso.layout = handle<VkPipelineLayout>(6);
+    pso.rectangle_variant_topology = rectangle_topology;
+    pso.variant = [&variant](std::uint32_t) { return variant.build(); };
+    pso.built = [&variant](std::uint32_t) { return variant.find(); };
+    context.add_graphics_pipeline(rectangle_id, pso);
+}
+
+bool record_indirect_rectangle(CommandList& list) {
+    Draw draw{};
+    draw.pipeline = rectangle_id;
+    draw.topology = rectangle_topology;
+    draw.count = 3;
+    draw.instances = 1;
+    draw.viewport = {0, 0, 16, 16, 0, 1};
+    return list.draw_indirect(std::move(draw), IndirectDrawArgs{rectangle_arguments, 0, 16, 1, 0, 0}) &&
+           list.close();
+}
+
+// The variant compiles once resource_mutex_ is released, as every other draw's pipeline does: prepare_draw used to
+// build it inline while the lock was held, stalling add_resource()/remove_resource() behind the compile.
+int test_indirect_rectangle_unlocks_resources() {
+    recorded_indirect_draws.store(0);
+    VulkanContext context(mock_get_device_proc, handle<VkDevice>(1), false, false, false, false, rectangle_indirect);
+    SlowPipeline slow;
+    add_indirect_rectangle(context, slow);
+    VulkanQueue queue(context, handle<VkQueue>(4), 0, VulkanQueue::QueueKind::direct);
+    EXPECT(queue.ok());
+    CommandList list;
+    EXPECT(record_indirect_rectangle(list));
+
+    ReplayResult result = ReplayResult::unsupported;
+    std::thread submit([&] {
+        const CommandList* ptr = &list;
+        result = queue.execute({&ptr, 1});
+    });
+    {
+        std::unique_lock lock(slow.mutex);
+        const bool entered = slow.cv.wait_for(lock, std::chrono::seconds(5), [&] { return slow.entered; });
+        if (!entered) {
+            slow.allow_finish = true;
+            slow.cv.notify_all();
+            lock.unlock();
+            submit.join();
+            EXPECT(false);
+        }
+    }
+
+    std::atomic<bool> unblocked{false};
+    std::thread resources([&] {
+        ResourceBinding temp{};
+        temp.buffer = handle<VkBuffer>(505);
+        temp.size = 64;
+        context.add_resource(5, temp);
+        context.remove_resource(5);
+        unblocked.store(true, std::memory_order_release);
+    });
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (!unblocked.load(std::memory_order_acquire) && std::chrono::steady_clock::now() < deadline)
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    const bool waited_for_compile = !unblocked.load(std::memory_order_acquire);
+
+    slow.release();
+    resources.join();
+    submit.join();
+    EXPECT(!waited_for_compile);
+    EXPECT(result == ReplayResult::success);
+    EXPECT(slow.builds.load() == 1);
+    EXPECT(recorded_indirect_draws.load() == 1);
+    return 0;
+}
+
+// A variant that cannot be built skips the draw, once across both passes, and the list still succeeds - even under
+// strict_replay(), as prepare_draw's own skip does. The build is not attempted again on pass-1 re-prepare.
+int test_failed_indirect_rectangle_skipped_once() {
+    recorded_indirect_draws.store(0);
+    VulkanContext context(mock_get_device_proc, handle<VkDevice>(1), false, false, false, false, rectangle_indirect);
+    SlowPipeline failing;
+    failing.fail = true;
+    failing.allow_finish = true;
+    add_indirect_rectangle(context, failing);
+    VulkanQueue queue(context, handle<VkQueue>(5), 0, VulkanQueue::QueueKind::direct);
+    EXPECT(queue.ok());
+    CommandList list;
+    EXPECT(record_indirect_rectangle(list));
+
+    const auto skips = indirect_stats::reason_skips(indirect_stats::topology);
+    const CommandList* ptr = &list;
+    EXPECT(queue.execute({&ptr, 1}) == ReplayResult::success);
+    EXPECT(failing.builds.load() == 1);
+    EXPECT(indirect_stats::reason_skips(indirect_stats::topology) == skips + 1);
+    EXPECT(recorded_indirect_draws.load() == 0);
+    return 0;
+}
+
 }  // namespace
 
 int main() {
+    // Before anything reads it (indirect_clamp_enabled() reads it once): the mock driver cannot prepare the clamp
+    // pass, which a device with the pass enabled requires of every indirect draw. Dispatch-only tests are unaffected.
+#ifdef _WIN32
+    _putenv_s("LEONIDA_INDIRECT_CLAMP", "0");
+#else
+    setenv("LEONIDA_INDIRECT_CLAMP", "0", 1);
+#endif
     init_mock_driver();
     if (test_unlocks_resources_during_compile(true) != 0) return 1;
     if (test_unlocks_resources_during_compile(false) != 0) return 1;
     if (test_failed_compute_dispatch_built_once() != 0) return 1;
+    if (test_indirect_rectangle_unlocks_resources() != 0) return 1;
+    if (test_failed_indirect_rectangle_skipped_once() != 0) return 1;
     std::printf("replay_pipeline_compile_unlock_test: passed\n");
     return 0;
 }
